@@ -4,7 +4,7 @@ primer_analysis.py
 목적: 사용자가 입력한 표적 DNA 서열과 Forward/Reverse primer를 분석하는 프로그램
 - 서열 유효성 검사
 - 프라이머 길이 / GC 함량 / Tm 계산
-- 표적 DNA 내 모든 결합 위치 탐색 및 올바른 방향의 PCR 산물 길이 계산
+- 표적 DNA 내 모든 결합 위치 탐색 및 올바른 방향(겹치지 않는 배치)의 PCR 산물 길이 계산
 - Forward/Reverse Tm 차이(ΔTm) 확인
 - Hairpin / Self-dimer / Heterodimer 구조 분석
 - 일반적인 설계 기준과 비교한 결과 요약 출력
@@ -20,8 +20,19 @@ primer_analysis.py
       표시하지 않기 위함)
 """
 
+import re
 import primer3
 from Bio.Seq import Seq
+
+
+# ---------------------------------------------------------------------------
+# 0. Tm 계산 조건 (기본값) — 임의로 변경하지 않고 계산에 사용한 값을 명시한다.
+# ---------------------------------------------------------------------------
+
+TM_MV_CONC = 50.0     # 1가 양이온(Na+/K+ 등) 농도 (mM)
+TM_DV_CONC = 0.0      # 2가 양이온(Mg2+) 농도 (mM)
+TM_DNTP_CONC = 0.0    # dNTP 농도 (mM)
+TM_DNA_CONC = 50.0    # 프라이머(DNA) 농도 (nM)
 
 
 # ---------------------------------------------------------------------------
@@ -29,10 +40,14 @@ from Bio.Seq import Seq
 # ---------------------------------------------------------------------------
 
 def clean_sequence(seq):
-    """서열을 받아서 대문자로 바꾸고, 공백/줄바꿈을 제거한다."""
+    """
+    서열을 받아서 대문자로 바꾸고, 모든 공백 문자(스페이스, 탭, 줄바꿈 등)를 제거한다.
+    - re.sub(r"\\s+", "", seq): 정규식으로 공백류 문자를 한 번에 제거
+      (\\s는 스페이스, 탭(\\t), 줄바꿈(\\n, \\r) 등을 모두 포함)
+    """
     seq = seq.strip()
     seq = seq.upper()
-    seq = seq.replace(" ", "")
+    seq = re.sub(r"\s+", "", seq)
     return seq
 
 
@@ -88,10 +103,12 @@ def calc_tm_simple(seq):
     return 2 * (a_count + t_count) + 4 * (g_count + c_count)
 
 
-def calc_tm_thermo(seq, mv_conc=50.0, dv_conc=0.0, dntp_conc=0.0, dna_conc=50.0):
+def calc_tm_thermo(seq, mv_conc=TM_MV_CONC, dv_conc=TM_DV_CONC,
+                    dntp_conc=TM_DNTP_CONC, dna_conc=TM_DNA_CONC):
     """
     Primer3-py의 열역학적 계산(Nearest-Neighbor 방식)으로 Tm을 계산한다.
-    실제 반응 조건(Mg2+ 농도 등)을 파라미터로 반영할 수 있어 Wallace rule보다 정확도가 높다.
+    기본값은 파일 상단의 TM_MV_CONC / TM_DV_CONC / TM_DNTP_CONC / TM_DNA_CONC 상수를 사용한다.
+    (실제 PCR 반응 조건을 입력받는 기능은 이번 단계에서는 추가하지 않음)
     """
     tm = primer3.bindings.calc_tm(
         seq,
@@ -149,17 +166,17 @@ def calc_pcr_product_length(target, forward_primer, reverse_primer):
     """
     PCR 산물 길이를 계산한다.
 
-    개선 사항:
-    - forward/reverse 각각 '모든' 결합 위치 후보를 구한 뒤,
-      모든 조합(forward 위치 x reverse 위치)을 검토한다.
-    - 올바른 PCR 증폭이 되려면 forward primer가 reverse primer보다
-      앞쪽(더 작은 인덱스)에서 시작해야 하고, reverse primer의 결합
-      부위(역상보서열) 끝이 forward 시작 위치보다 뒤에 있어야 한다.
-      (= 두 프라이머가 서로 마주보며 가운데 영역을 증폭하는 배치)
-    - 조건을 만족하는 조합이 하나도 없으면 산물 길이를 계산하지 않고
-      그 이유를 함께 반환한다.
-    - 조건을 만족하는 조합이 여러 개면, 가장 짧은 산물(가장 안쪽 조합)을
-      대표 결과로 반환하고 나머지 조합도 함께 알려준다.
+    유효한 증폭 조합의 조건 (모두 만족해야 함):
+    - Forward primer 결합 구간: [fwd_pos, fwd_end)  (fwd_end = fwd_pos + len(forward_primer))
+    - Reverse primer 결합 구간(역상보서열 기준): [rev_pos, rev_end)
+    - Forward 결합 구간이 끝난 뒤에 Reverse 결합 구간이 시작해야 한다.
+      즉 fwd_end <= rev_pos 를 만족해야 하며, 이 조건이 바로
+      "두 구간이 겹치지 않고, Forward가 앞쪽에서 Reverse를 마주보는 배치"를 의미한다.
+    - 이 조건을 만족하지 않으면 (겹치거나, Forward가 Reverse보다 뒤에 있는 경우)
+      잘못된 방향/겹침으로 보고 유효 조합에서 제외한다.
+
+    이번 버전에서는 "가장 짧은 산물을 대표로 선택"하지 않고,
+    조건을 만족하는 모든 조합을 그대로 반환한다. (최종 선택은 사용자가 비교해서 판단)
     """
     fwd_positions, fwd_seq = find_all_binding_positions(target, forward_primer, is_reverse=False)
     rev_positions, rev_seq = find_all_binding_positions(target, reverse_primer, is_reverse=True)
@@ -167,8 +184,7 @@ def calc_pcr_product_length(target, forward_primer, reverse_primer):
     result = {
         "fwd_positions": fwd_positions,
         "rev_positions": rev_positions,
-        "valid_combinations": [],  # (fwd_pos, rev_pos, product_length)
-        "product_length": None,
+        "valid_combinations": [],  # (fwd_pos, rev_pos, product_length) 의 리스트
         "reason": "",
     }
 
@@ -184,26 +200,26 @@ def calc_pcr_product_length(target, forward_primer, reverse_primer):
         result["reason"] = "Reverse primer의 결합 위치를 찾지 못했습니다."
         return result
 
+    fwd_len = len(forward_primer)
+
     # 모든 (forward 위치, reverse 위치) 조합을 검토한다.
     for fwd_pos in fwd_positions:
+        fwd_end = fwd_pos + fwd_len
         for rev_pos in rev_positions:
             rev_end = rev_pos + len(rev_seq)
-            # 조건: forward가 reverse보다 앞에서 시작하고, 두 프라이머가 마주보는 배치여야 함
-            if fwd_pos < rev_end and rev_pos >= fwd_pos:
+            # 핵심 조건: Forward 결합 구간이 끝난 뒤에 Reverse 결합 구간이 시작해야 함
+            # (겹치지 않아야 하고, Forward가 Reverse보다 앞에 있어야 함)
+            if fwd_end <= rev_pos:
                 product_length = rev_end - fwd_pos
                 result["valid_combinations"].append((fwd_pos, rev_pos, product_length))
 
     if not result["valid_combinations"]:
         result["reason"] = (
-            "Forward와 Reverse primer의 결합 위치가 올바른 증폭 방향(서로 마주보는 배치)을 "
-            "만족하지 않습니다. (Forward가 Reverse보다 뒤에 있거나 겹치는 등)"
+            "Forward와 Reverse primer의 결합 구간이 겹치거나, Forward가 Reverse보다 "
+            "앞쪽에 위치하지 않아 올바른 증폭 방향(서로 마주보며 겹치지 않는 배치)을 "
+            "만족하는 조합이 없습니다."
         )
-        return result
 
-    # 가장 짧은(가장 안쪽) 조합을 대표 산물로 선택
-    best = min(result["valid_combinations"], key=lambda x: x[2])
-    result["product_length"] = best[2]
-    result["best_combination"] = best
     return result
 
 
@@ -311,24 +327,32 @@ def print_final_summary(
         print("주의: Tm 차이가 커서 두 프라이머가 같은 annealing 온도 조건에서 "
               "동시에 잘 결합하지 않을 가능성이 있습니다.")
 
-    # 결합 위치 및 산물 길이
+    # 결합 위치 및 산물 길이 (모든 유효 조합을 나열)
     print(f"\n--- 결합 위치 및 PCR 산물 길이 ---")
     fwd_positions = product_result["fwd_positions"]
     rev_positions = product_result["rev_positions"]
     print(f"Forward primer 결합 위치: {fwd_positions if fwd_positions else '없음'}")
     print(f"Reverse primer 결합 위치(역상보서열 기준): {rev_positions if rev_positions else '없음'}")
+    print("※ 결합 위치는 0부터 시작하는 인덱스입니다.")
 
-    if product_result["product_length"] is not None:
-        best_fwd, best_rev, best_len = product_result["best_combination"]
-        print(f"[양호] 예상 PCR 산물 길이: {best_len} bp "
-              f"(Forward 위치 {best_fwd}, Reverse 위치 {best_rev} 조합 기준)")
-        if len(product_result["valid_combinations"]) > 1:
-            print(f"참고: 조건을 만족하는 결합 위치 조합이 "
-                  f"{len(product_result['valid_combinations'])}개 발견되었습니다. "
-                  f"가장 짧은 산물을 기준으로 표시했습니다.")
-            print(f"전체 조합: {product_result['valid_combinations']}")
+    valid_combinations = product_result["valid_combinations"]
+    if valid_combinations:
+        print(f"[양호] 올바른 방향의 PCR 산물 조합이 {len(valid_combinations)}개 발견되었습니다. "
+              f"(가장 짧은 조합을 자동으로 추천하지 않으니 아래에서 직접 비교해 보세요.)")
+        print(f"{'번호':<4}{'Forward 위치':<14}{'Reverse 위치':<14}{'예상 산물 길이'}")
+        for i, (fwd_pos, rev_pos, length) in enumerate(valid_combinations, start=1):
+            print(f"{i:<4}{fwd_pos:<14}{rev_pos:<14}{length} bp")
     else:
         print(f"[주의] PCR 산물 길이를 계산할 수 없습니다. 이유: {product_result['reason']}")
+
+    # Tm 계산 조건 표시
+    print(f"\n--- Tm 계산에 사용한 조건 (기본값) ---")
+    print(f"1가 양이온(Na+/K+ 등) 농도: {TM_MV_CONC} mM")
+    print(f"Mg2+(2가 양이온) 농도: {TM_DV_CONC} mM")
+    print(f"dNTP 농도: {TM_DNTP_CONC} mM")
+    print(f"프라이머(DNA) 농도: {TM_DNA_CONC} nM")
+    print("※ 위 값은 실제 PCR 반응 조건이 아니라 이 프로그램이 사용하는 기본값입니다. "
+          "실제 반응 조건이 다르면 Tm 계산 결과도 달라질 수 있습니다.")
 
     print("\n※ 위 기준들은 일반적으로 참고되는 설계 가이드라인이며, 실제 PCR 성공 여부를 보장하지 않습니다.")
     print("※ [주의]로 표시된 항목은 프라이머를 재설계할 때 우선적으로 검토해 볼 부분입니다.")
@@ -367,16 +391,18 @@ def main():
     print(f"길이: {rev_len} bp / GC 함량: {rev_gc} %")
     print(f"Tm (단순 계산식): {rev_tm_simple} ℃ / Tm (열역학적 계산): {rev_tm_thermo} ℃")
 
-    # 결합 위치 및 PCR 산물 길이 (모든 위치 탐색 + 방향 검증 포함)
+    # 결합 위치 및 PCR 산물 길이 (모든 위치 탐색 + 겹침/방향 검증 + 모든 유효 조합 반환)
     product_result = calc_pcr_product_length(target_dna, forward_primer, reverse_primer)
 
     print("\n[결합 위치 확인]")
     print(f"Forward primer 결합 위치: {product_result['fwd_positions'] if product_result['fwd_positions'] else '찾을 수 없음'}")
     print(f"Reverse primer 결합 위치(역상보서열 기준): {product_result['rev_positions'] if product_result['rev_positions'] else '찾을 수 없음'}")
+    print("※ 결합 위치는 0부터 시작하는 인덱스입니다.")
 
-    if product_result["product_length"] is not None:
-        best_fwd, best_rev, best_len = product_result["best_combination"]
-        print(f"\n예상 PCR 산물 길이: {best_len} bp (Forward 위치 {best_fwd}, Reverse 위치 {best_rev})")
+    if product_result["valid_combinations"]:
+        print(f"\n유효한 PCR 산물 조합 {len(product_result['valid_combinations'])}개:")
+        for i, (fwd_pos, rev_pos, length) in enumerate(product_result["valid_combinations"], start=1):
+            print(f"  {i}. Forward 위치 {fwd_pos}, Reverse 위치 {rev_pos} -> 예상 산물 길이 {length} bp")
     else:
         print(f"\nPCR 산물 길이를 계산할 수 없습니다. 이유: {product_result['reason']}")
 
